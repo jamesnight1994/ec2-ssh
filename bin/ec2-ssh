@@ -1,0 +1,77 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+# Copyright (c) 2019-Present Sote Inc
+# All Rights Reserved
+import itertools
+import os
+import re
+import boto3
+import click
+
+from ec2_ssh.auth import (configure_ssh_authorized_keys_command,
+                           OsGroup, OsUser)
+
+@click.group()
+def cli():
+    pass
+
+
+@cli.command(help='Find the SSH keys of the specified user and print them')
+@click.argument('username')
+def print_keys(username):
+    user = OsUser(username)
+    keys = "\n".join([key for key in user.ssh_public_keys])
+    print(keys)
+
+
+@cli.command(help='Configure the system to use sote-ssh-auth to periodically '
+             'sync user accounts from IAM and to authenticate SSH connections')
+@click.option('--cron-schedule',
+              default='*/30 * * * *',
+              help='The cron schedule for syncing user accounts with IAM')
+def install(cron_schedule):
+    configure_ssh_authorized_keys_command()
+
+
+@cli.command(help='Sync the user accounts with users in the specified IAM groups')
+@click.option('--iam-group',
+              help='Sync the user accounts with the users in this IAM group')
+@click.option('--iam-sudo-group',
+              help='Sync the user accounts with the users in this IAM group '
+              'and grant them sudo access')
+def sync(iam_group, iam_sudo_group):
+    """Get the IAM users from the specified IAM group"""
+    if not iam_group and not iam_sudo_group:
+        raise click.UsageError('At least one of iam-group or iam-sudo-group must be specified')
+
+    groups = []
+    if iam_group:
+        groups.append(OsGroup(iam_group))
+
+    if iam_sudo_group:
+        groups.append(OsGroup(iam_sudo_group, True))
+
+    client = boto3.client('iam')
+    paginator = client.get_paginator('get_group')
+
+    all_iam_users = set()
+    for group in groups:
+        if not group.exists:
+            group.create()
+
+        page_iterator = paginator.paginate(GroupName=group.name)
+        for entry in page_iterator:
+            iam_users = [e['UserName'] for e in entry['Users']]
+            group.sync(iam_users)
+            all_iam_users.update(iam_users)
+
+    # Remove all users that exist in the OS but not in the IAM groups
+    all_os_users =  set(itertools.chain(*[group.members for group in groups]))
+    for username in all_os_users.difference(all_iam_users):
+        OsUser(username).delete()
+
+
+
+if __name__ == '__main__':
+    cli()
